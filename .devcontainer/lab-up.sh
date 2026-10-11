@@ -8,7 +8,21 @@
 #   3. creates the console user "admin" on the first run and prints its
 #      one-time password;
 #   4. prints where the console is.
+#
+# Options:
+#   --analytics  also run ClickHouse (and the OTel collector and Jaeger from
+#                examples/08-observability), which the console's Overview
+#                dashboard, Access Logs and Session Timeline read from. The
+#                choice is remembered, so later runs keep it.
 set -euo pipefail
+
+ANALYTICS_ARG=""
+for arg in "$@"; do
+  case "$arg" in
+    --analytics) ANALYTICS_ARG=1 ;;
+    *) echo "usage: $0 [--analytics]" >&2; exit 2 ;;
+  esac
+done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$HOME/.gateway-lab.env" # outside the repo, so it is never committed
@@ -36,9 +50,24 @@ if [ -z "${GATEWAY_MASTER_KEY:-}" ]; then
 fi
 export GATEWAY_MASTER_KEY
 
+cd "$ROOT"
+
+# Analytics: start ClickHouse with the same overlay the quickstart uses to
+# preserve it, so the quickstart below finds it running and keeps it (and
+# never recreates the gateway without our master key).
+if [ -n "$ANALYTICS_ARG" ] && [ -z "${GATEWAY_LAB_ANALYTICS:-}" ]; then
+  GATEWAY_LAB_ANALYTICS=1
+  save GATEWAY_LAB_ANALYTICS 1
+fi
+if [ -n "${GATEWAY_LAB_ANALYTICS:-}" ]; then
+  echo "lab: starting the analytics stack (ClickHouse, OTel collector, Jaeger)"
+  GATEWAY_SINKS_CLICKHOUSE_ENABLED=true docker compose \
+    -f deploy/docker-compose.yml -f examples/08-observability/docker-compose.observability.yml \
+    --profile analytics up --build -d
+fi
+
 # 2. Tuskira's quickstart. It reuses GATEWAY_ADMIN_KEY when set; otherwise it
 #    bootstraps an admin key and prints it as "Admin key:  gk_...".
-cd "$ROOT"
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 GATEWAY_ADMIN_KEY="${GATEWAY_ADMIN_KEY:-}" ./examples/01-quickstart/run.sh 2>&1 | tee "$log"
@@ -68,6 +97,13 @@ if [ -n "${CODESPACE_NAME:-}" ]; then
 else
   console="http://localhost:8081"
 fi
+if [ -n "${GATEWAY_LAB_ANALYTICS:-}" ]; then
+  analytics_line="Analytics:  on (Overview, Access Logs, Session Timeline)"
+  stop_cmd="docker compose -f deploy/docker-compose.yml -f examples/08-observability/docker-compose.observability.yml --profile analytics down"
+else
+  analytics_line="Analytics:  off (LLM Logs works; for the Overview dashboard re-run with --analytics)"
+  stop_cmd="${COMPOSE[*]} down"
+fi
 cat <<EOF
 
 ================================================================
@@ -86,9 +122,10 @@ else
   echo "Password:   the one you chose at first sign-in"
 fi
 cat <<EOF
+$analytics_line
 
 Admin key and master key are saved in $ENV_FILE.
 In a new terminal, load them with:   source $ENV_FILE
-Stop the stack with:                 ${COMPOSE[*]} down
+Stop the stack with:                 $stop_cmd
 ================================================================
 EOF
