@@ -1,0 +1,31 @@
+{
+  // Fork-only: a GitHub Codespace for running and learning the gateway.
+  // Docker runs inside the Codespace, so `docker compose` works as it does on
+  // a laptop. Go and Node are here for building and the examples.
+  // Start the lab with:  bash .devcontainer/lab-up.sh
+  "name": "AI Agent Gateway lab",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/go:1": { "version": "1.27" },
+    "ghcr.io/devcontainers/features/node:1": { "version": "26" }
+  },
+  // 2 cores / 8 GB is enough for the default stack and keeps the free
+  // Codespaces allowance lasting longest. Pick a bigger machine when
+  // creating the Codespace if you add the analytics profile (ClickHouse).
+  "hostRequirements": { "cpus": 2, "memory": "8gb" },
+  "forwardPorts": [8081, 8080, 8082],
+  "portsAttributes": {
+    // The console refuses to be framed (frame-ancestors 'none'), so open it
+    // in a normal browser tab rather than the editor's preview pane.
+    "8081": { "label": "Console + control API", "onAutoForward": "openBrowser" },
+    "8080": { "label": "MCP plane", "onAutoForward": "silent" },
+    "8082": { "label": "LLM plane", "onAutoForward": "silent" }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.go"]
+    }
+  }
+}
