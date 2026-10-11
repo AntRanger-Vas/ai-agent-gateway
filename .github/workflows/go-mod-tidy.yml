@@ -1,0 +1,60 @@
+name: Go module tidy (fork helper)
+
+# Fork-only helper. The build session that writes code for this fork cannot
+# download Go modules, so it can edit a go.mod but cannot recompute go.sum.
+# When a branch other than main changes a go.mod, this runs `go mod tidy` for
+# both modules (the gateway and detection/) and commits the result back to the
+# same branch.
+#
+# A push made with GITHUB_TOKEN does not trigger other workflows, so this
+# commit never re-triggers this workflow or CI. Open (or close and reopen) the
+# pull request after the tidy commit lands, so CI runs on the tidied head.
+
+on:
+  push:
+    branches-ignore: [main]
+    paths:
+      - "go.mod"
+      - "detection/go.mod"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: go-mod-tidy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tidy:
+    name: go mod tidy
+    if: github.repository != 'Tuskira/ai-agent-gateway'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: go mod tidy
+        run: |
+          set -euo pipefail
+          go mod tidy
+          (cd detection && go mod tidy)
+          git status --short
+
+      - name: commit and push
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "go.mod and go.sum are already tidy; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add go.mod go.sum detection/go.mod detection/go.sum
+          git commit -m "chore(deps): go mod tidy" \
+            -m "Recomputed by the go-mod-tidy fork helper after a go.mod change."
+          git push origin "HEAD:${GITHUB_REF_NAME}"
