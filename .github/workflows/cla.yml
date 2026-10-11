@@ -31,6 +31,10 @@ permissions:
 jobs:
   cla-assistant:
     name: Check CLA signature
+    # The CLA is Tuskira's, for contributions to Tuskira's repo. In a fork it
+    # would ask the fork's owner to sign it for their own changes, so only run
+    # it upstream (the same guard the publish workflows use).
+    if: github.repository == 'Tuskira/ai-agent-gateway'
     runs-on: ubuntu-latest
     steps:
       - name: CLA Assistant
