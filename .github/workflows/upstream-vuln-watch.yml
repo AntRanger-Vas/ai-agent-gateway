@@ -66,8 +66,10 @@ jobs:
           found=false
           for mod in . detection; do
             echo "### module: ${mod}" >> "$report"
-            (cd "$mod" && govulncheck ./...) >> "$report" 2>&1
-            rc=$?
+            # Actions runs bash with -e, so capture the exit code rather than
+            # let a finding (exit 3) end the step.
+            rc=0
+            (cd "$mod" && govulncheck ./...) >> "$report" 2>&1 || rc=$?
             echo >> "$report"
             # govulncheck exits 0 when clean, 3 when it finds reachable
             # vulnerabilities, and anything else on a scan error.
