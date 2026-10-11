@@ -1,0 +1,146 @@
+name: Upstream vulnerability watch
+
+# Fork-only. Once a day, scans Tuskira's upstream main with govulncheck (the
+# scanner upstream CI's security job uses) across both Go modules, and keeps
+# one issue in this fork up to date: opened when upstream has reachable
+# vulnerabilities, updated when the list changes, closed when upstream scans
+# clean. GitHub notifies the fork's owner about the issue.
+#
+# Upstream CI only runs govulncheck on pull requests and pushes, so an
+# advisory published after the last upstream commit goes unnoticed until the
+# next one. This closes that gap for us. Reporting to Tuskira stays a human
+# decision: upstream SECURITY.md asks for security@tuskira.ai or GitHub's
+# private vulnerability reporting, never a public issue.
+
+on:
+  schedule:
+    - cron: "17 21 * * *" # daily, about 08:17 in eastern Australia (AEDT)
+  workflow_dispatch:
+  # Re-test the watch whenever this file changes in a pull request.
+  pull_request:
+    paths:
+      - ".github/workflows/upstream-vuln-watch.yml"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-vuln-watch
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Tuskira/ai-agent-gateway
+  LABEL: upstream-vuln-watch
+
+jobs:
+  scan:
+    name: govulncheck upstream main
+    if: github.repository != 'Tuskira/ai-agent-gateway'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: check out upstream main
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: main
+          path: upstream
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+          cache: false
+
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: scan
+        id: scan
+        working-directory: upstream
+        run: |
+          set -uo pipefail
+          report="$GITHUB_WORKSPACE/report.txt"
+          : > "$report"
+          found=false
+          for mod in . detection; do
+            echo "### module: ${mod}" >> "$report"
+            (cd "$mod" && govulncheck ./...) >> "$report" 2>&1
+            rc=$?
+            echo >> "$report"
+            # govulncheck exits 0 when clean, 3 when it finds reachable
+            # vulnerabilities, and anything else on a scan error.
+            if [ "$rc" -eq 3 ]; then
+              found=true
+            elif [ "$rc" -ne 0 ]; then
+              cat "$report"
+              echo "::error::govulncheck failed in module ${mod} (exit ${rc})"
+              exit "$rc"
+            fi
+          done
+          ids=$(grep -E 'Vulnerability #[0-9]+: GO-' "$report" | grep -oE 'GO-[0-9]{4}-[0-9]+' | sort -u | paste -sd, - || true)
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "ids=${ids}"
+            echo "found=${found}"
+          } >> "$GITHUB_OUTPUT"
+          cat "$report"
+
+      - name: open, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FOUND: ${{ steps.scan.outputs.found }}
+          IDS: ${{ steps.scan.outputs.ids }}
+          SHA: ${{ steps.scan.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          short="${SHA:0:7}"
+          ids_text="${IDS//,/, }"
+          gh label create "$LABEL" --color B60205 \
+            --description "Reachable vulnerabilities in Tuskira upstream main" --force >/dev/null
+          existing=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+
+          if [ "$FOUND" != "true" ]; then
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --comment \
+                "Upstream \`main\` at ${UPSTREAM_REPO}@${short} now scans clean. Closing. ([scan](${RUN_URL}))"
+            fi
+            echo "No reachable vulnerabilities in ${UPSTREAM_REPO}@${short}."
+            exit 0
+          fi
+
+          marker="<!-- ids: ${IDS} -->"
+          {
+            echo "$marker"
+            echo "govulncheck found **reachable** vulnerabilities in [${UPSTREAM_REPO}@${short}](https://github.com/${UPSTREAM_REPO}/commit/${SHA}): **${ids_text}**."
+            echo
+            echo "Scan run: ${RUN_URL}"
+            echo
+            echo "### Reporting to Tuskira"
+            echo "Upstream \`SECURITY.md\` asks for reports by email to **security@tuskira.ai**, or through the repository's **Security → Report a vulnerability** (private). Don't open a public issue upstream."
+            echo
+            echo "<details><summary>Scan output</summary>"
+            echo
+            echo '```'
+            head -c 50000 report.txt
+            echo '```'
+            echo
+            echo "</details>"
+          } > body.md
+          title="Upstream vulnerability watch: ${ids_text} in ${UPSTREAM_REPO}@${short}"
+
+          if [ -z "$existing" ]; then
+            gh issue create --title "$title" --label "$LABEL" --body-file body.md
+          else
+            old=$(gh issue view "$existing" --json body --jq '.body' | grep -oE '<!-- ids: [^>]* -->' | head -n 1 || true)
+            if [ "$old" != "$marker" ]; then
+              gh issue edit "$existing" --title "$title" --body-file body.md
+              gh issue comment "$existing" --body \
+                "The finding changed: now **${ids_text}** at ${short}. ([scan](${RUN_URL}))"
+            else
+              echo "Issue #${existing} already tracks ${ids_text}; nothing new to report."
+            fi
+          fi
