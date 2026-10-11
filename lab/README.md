@@ -6,6 +6,7 @@ Hands-on checks against a running gateway, written for this fork. Tuskira's own 
 |---|---|---|
 | [`01-bound-key.sh`](01-bound-key.sh) | A key **bound** to a profile can't use tools outside it, even when it names another profile. An **unbound** key can pick any profile by name. Revoking a key takes effect at once. | `./examples/05-profiles/run.sh` (creates "Echo Only" and "Full Access") |
 | [`02-claude-code-via-gateway.sh`](02-claude-code-via-gateway.sh) | Routes **Claude Code's own model calls** through the LLM plane, so each one shows in **LLM Logs** with model, tokens, estimated cost and session. Optional `--daily-usd N` budget, enforced by the gateway. | `lab-up.sh` (add `--analytics` for the Overview dashboard) |
+| [`03-laptop-key.sh`](03-laptop-key.sh) + [`windows/claude-via-gateway.ps1`](windows/claude-via-gateway.ps1) | Claude Code on your **Windows laptop** goes through the Codespace gateway, with its own key so it shows separately. See [03](#03-claude-code-on-your-windows-laptop-through-the-codespace-gateway). | The lab running in the Codespace; GitHub CLI and Claude Code on the laptop |
 
 ## 02: monitoring your Claude Code usage
 
@@ -36,3 +37,17 @@ Each script creates its own keys, revokes them when it finishes, prints `PASS`/`
 | revoked | none | `echo` | `-32001` unauthorized |
 
 `get-env` returns the sample MCP server's environment variables. In a Codespace that environment can include tokens such as `GITHUB_TOKEN`. The script counts sensitive-looking variable **names** to make the point, and never prints values. That's the risk the unbound row shows: a leaked unbound key can name the most permissive profile and reach tools like this one. Bind every agent key.
+
+## 03: Claude Code on your Windows laptop, through the Codespace gateway
+
+| Where | Run | Does |
+|---|---|---|
+| Codespace | `bash lab/03-laptop-key.sh --daily-usd 5` | Creates the agent key `claude-code-laptop` (separate from the Codespace's `claude-code` key, so Token Monitoring shows the two apart) and prints it **once**. `--rotate` issues a fresh one. |
+| Laptop, once | `winget install --id GitHub.cli`, then `gh auth login`, then `gh auth refresh -h github.com -s codespace` | GitHub CLI, allowed to reach your Codespaces. |
+| Laptop, once | `irm https://claude.ai/install.ps1 \| iex` | Claude Code, if it isn't installed yet. |
+| Laptop, each time | `powershell -ExecutionPolicy Bypass -File claude-via-gateway.ps1` | [`windows/claude-via-gateway.ps1`](windows/claude-via-gateway.ps1): asks for the key on first run and stores it encrypted for your Windows account (DPAPI); opens a private tunnel to the gateway's LLM plane (`gh codespace ports forward`, 127.0.0.1 only); starts Claude Code through it; closes the tunnel when Claude Code exits. |
+
+- Nothing on the laptop changes permanently. The two Claude Code variables are set for that window only, and other terminals keep talking to Anthropic directly.
+- `-ExecutionPolicy Bypass` applies to that one `powershell` process. It doesn't change your machine's policy.
+- If the Codespace is asleep, the launcher says so and doesn't start Claude Code half-configured.
+- Arguments the launcher doesn't recognise go to Claude Code, for example `... claude-via-gateway.ps1 --continue`.
