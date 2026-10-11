@@ -1,46 +1,63 @@
 <#
 .SYNOPSIS
-  Start Claude Code on this laptop with its model calls going through the
-  AI Agent Gateway lab running in your GitHub Codespace.
+  Start Claude Code on this laptop with its model calls AND its tool calls
+  going through the AI Agent Gateway lab running in your GitHub Codespace.
 
 .DESCRIPTION
   1. First run only: asks for the 'claude-code-laptop' gateway key (printed by
      lab/03-laptop-key.sh in the Codespace) and stores it encrypted for your
      Windows account (DPAPI) in %USERPROFILE%\.gateway-lab\laptop-key.
-  2. Opens a private tunnel from 127.0.0.1:8082 on this laptop to the gateway's
-     LLM plane in the Codespace (gh codespace ports forward). Nothing is
-     exposed to the internet; GitHub authenticates the tunnel as you.
-  3. Starts Claude Code with ANTHROPIC_BASE_URL and ANTHROPIC_CUSTOM_HEADERS
-     set for this window only. Your claude.ai login stays the credential
-     Anthropic sees. When Claude Code exits, the tunnel closes; other
-     terminals and your settings are untouched.
+  2. Opens a private tunnel from this laptop to the gateway in the Codespace
+     (gh codespace ports forward): 127.0.0.1:8082 to the LLM plane and
+     127.0.0.1:8080 to the MCP (tool) plane. Nothing is exposed to the
+     internet; GitHub authenticates the tunnel as you.
+  3. Starts Claude Code for this window only with:
+       - ANTHROPIC_BASE_URL / ANTHROPIC_CUSTOM_HEADERS: model calls go through
+         the gateway; your claude.ai login stays the credential Anthropic sees;
+       - --mcp-config: the gateway as an extra tool server named "gateway".
+         The config file holds a ${GATEWAY_LAPTOP_KEY} placeholder, never the
+         key; Claude Code fills it in from this process's environment. If the
+         key is bound to a profile (lab/03-laptop-key.sh --profile), only that
+         profile's tools are visible or callable.
+     When Claude Code exits, the tunnel closes; other terminals, your other
+     tool servers and your Claude Code settings are untouched.
 
   Needs: GitHub CLI (winget install --id GitHub.cli), signed in with the
   codespace scope (gh auth refresh -h github.com -s codespace), and Claude
   Code (irm https://claude.ai/install.ps1 | iex). The Codespace must be
   running with the lab started (bash .devcontainer/lab-up.sh).
 
-.PARAMETER ResetKey
-  Forget the stored key and ask again (after lab/03-laptop-key.sh --rotate).
+OPTIONS (matched exactly; everything else is passed to Claude Code)
+  -ResetKey   Forget the stored key and ask again (after lab/03-laptop-key.sh --rotate).
+  -NoTools    Route only model calls; don't add the gateway as a tool server.
+  -Repo X     The fork whose Codespace to use (default AntRanger-Vas/ai-agent-gateway).
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File claude-via-gateway.ps1
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File claude-via-gateway.ps1 -ResetKey
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File claude-via-gateway.ps1 --continue
-  Arguments the script doesn't recognise are passed on to Claude Code.
+  powershell -ExecutionPolicy Bypass -File claude-via-gateway.ps1 -c
+  Continues your last Claude Code conversation (any Claude Code flag works: -c, -r, -p "..." and so on).
 #>
-# PositionalBinding off: anything you don't name goes to Claude Code, never
-# into -Repo or -LocalPort by position.
-[CmdletBinding(PositionalBinding = $false)]
-param(
-  [switch]$ResetKey,
-  [string]$Repo = 'AntRanger-Vas/ai-agent-gateway',
-  [int]$LocalPort = 8082,
-  [Parameter(ValueFromRemainingArguments = $true)]
-  [string[]]$ClaudeArgs
-)
+# No param() block on purpose. PowerShell's parameter binding matches flags by
+# prefix and adds its own common parameters, so Claude Code's short flags were
+# swallowed or rejected (-p is ambiguous with -PipelineVariable, -r with
+# -ResetKey/-Repo, -c had no value). The launcher's three options are matched
+# exactly here; every other argument goes to Claude Code untouched.
+$ResetKey = $false
+$NoTools = $false
+$Repo = 'AntRanger-Vas/ai-agent-gateway'
+$LocalPort = 8082
+$McpLocalPort = 8080
+$ClaudeArgs = @()
+for ($i = 0; $i -lt $args.Count; $i++) {
+  $a = [string]$args[$i]
+  if ($a -ieq '-ResetKey') { $ResetKey = $true }
+  elseif ($a -ieq '-NoTools') { $NoTools = $true }
+  elseif ($a -ieq '-Repo' -and ($i + 1) -lt $args.Count) { $i++; $Repo = [string]$args[$i] }
+  else { $ClaudeArgs += $a }
+}
 $ErrorActionPreference = 'Stop'
 
 function Fail([string]$Message) {
@@ -94,36 +111,62 @@ if (-not $codespace) {
 }
 
 $base = "http://127.0.0.1:$LocalPort"
+$mcpBase = "http://127.0.0.1:$McpLocalPort"
+$forward = @("8082:$LocalPort")
+$checks = @("$base/health")
+if (-not $NoTools) {
+  $forward += "8080:$McpLocalPort"
+  $checks += "$mcpBase/health"
+}
 $log = Join-Path $dir 'tunnel.log'
-Write-Host "Opening a tunnel to $($codespace.name) (gateway LLM plane) on $base ..."
+Write-Host "Opening a tunnel to $($codespace.name) (gateway: $($forward -join ', ')) ..."
 $tunnel = Start-Process -FilePath 'gh' -PassThru -NoNewWindow `
-  -ArgumentList @('codespace', 'ports', 'forward', "8082:$LocalPort", '-c', $codespace.name) `
+  -ArgumentList (@('codespace', 'ports', 'forward') + $forward + @('-c', $codespace.name)) `
   -RedirectStandardOutput "$log.out" -RedirectStandardError $log
 
-$ready = $false
-for ($i = 0; $i -lt 30 -and -not $ready; $i++) {
+# Wait until every forwarded plane answers its /health.
+$pending = @($checks)
+for ($i = 0; $i -lt 30 -and $pending.Count -gt 0; $i++) {
   Start-Sleep -Seconds 1
-  try {
-    $r = Invoke-WebRequest -UseBasicParsing -Uri "$base/health" -TimeoutSec 2
-    $ready = ($r.StatusCode -eq 200)
-  } catch { }
-  if (-not $ready -and $tunnel.HasExited) { break }
+  $still = @()
+  foreach ($url in $pending) {
+    $ok = $false
+    try { $ok = ((Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 2).StatusCode -eq 200) } catch { }
+    if (-not $ok) { $still += $url }
+  }
+  $pending = $still
+  if ($pending.Count -gt 0 -and $tunnel.HasExited) { break }
 }
-if (-not $ready) {
+if ($pending.Count -gt 0) {
   if (-not $tunnel.HasExited) { Stop-Process -Id $tunnel.Id -Force -ErrorAction SilentlyContinue }
   $why = ''
   if (Test-Path $log) { $why = (Get-Content $log -Tail 5) -join "`n       " }
-  Fail "The gateway didn't answer on $base/health. Is the lab running in the Codespace (bash .devcontainer/lab-up.sh)?`n       Tunnel output: $why"
+  Fail "The gateway didn't answer on $($pending -join ', '). Is the lab running in the Codespace (bash .devcontainer/lab-up.sh)?`n       Tunnel output: $why"
 }
-Write-Host "Gateway reachable. Starting Claude Code through it (type /status to check, /exit to finish)." -ForegroundColor Green
 
 # 3. Claude Code, routed through the gateway for this window only.
 $env:ANTHROPIC_BASE_URL = $base
 $env:ANTHROPIC_CUSTOM_HEADERS = "X-Gateway-Key: $gatewayKey"
+$launchArgs = @()
+if (-not $NoTools) {
+  # The file holds a placeholder, never the key: Claude Code expands
+  # ${GATEWAY_LAPTOP_KEY} from this process's environment when it connects.
+  # ASCII, so Windows PowerShell 5.1 writes no byte-order mark.
+  $mcpFile = Join-Path $dir 'mcp.json'
+  $mcpJson = '{"mcpServers":{"gateway":{"type":"http","url":"' + $mcpBase + '/mcp",' +
+             '"headers":{"Authorization":"Bearer ${GATEWAY_LAPTOP_KEY}"}}}}'
+  Set-Content -Path $mcpFile -Value $mcpJson -Encoding Ascii
+  $env:GATEWAY_LAPTOP_KEY = $gatewayKey
+  $launchArgs += @('--mcp-config', $mcpFile)
+  Write-Host "Gateway reachable. Model calls and the 'gateway' tool server go through it. /status and /mcp to check, /exit to finish." -ForegroundColor Green
+} else {
+  Write-Host "Gateway reachable. Model calls go through it. /status to check, /exit to finish." -ForegroundColor Green
+}
+if ($ClaudeArgs) { $launchArgs += $ClaudeArgs }
 try {
-  & claude @ClaudeArgs
+  & claude @launchArgs
 } finally {
-  Remove-Item Env:ANTHROPIC_BASE_URL, Env:ANTHROPIC_CUSTOM_HEADERS -ErrorAction SilentlyContinue
+  Remove-Item Env:ANTHROPIC_BASE_URL, Env:ANTHROPIC_CUSTOM_HEADERS, Env:GATEWAY_LAPTOP_KEY -ErrorAction SilentlyContinue
   if (-not $tunnel.HasExited) { Stop-Process -Id $tunnel.Id -Force -ErrorAction SilentlyContinue }
   Write-Host "Tunnel closed. This window is back to normal."
 }
