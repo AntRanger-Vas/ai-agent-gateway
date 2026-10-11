@@ -101,6 +101,11 @@ jobs:
           set -euo pipefail
           short="${SHA:0:7}"
           ids_text="${IDS//,/, }"
+          # GitHub creates forks with Issues switched off.
+          if [ "$(gh api "repos/${GH_REPO}" --jq .has_issues)" != "true" ]; then
+            echo "::error::Issues are disabled on ${GH_REPO}, so the watch has nowhere to report. Enable them under Settings → General → Features → Issues, then re-run this workflow."
+            exit 1
+          fi
           gh label create "$LABEL" --color B60205 \
             --description "Reachable vulnerabilities in Tuskira upstream main" --force >/dev/null
           existing=$(gh issue list --label "$LABEL" --state open --json number --jq '.[0].number // empty')
